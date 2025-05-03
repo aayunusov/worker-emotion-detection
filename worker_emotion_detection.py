@@ -118,36 +118,37 @@ class WorkerEmotionDetector:
                                     detector_backend='opencv',
                                     silent=True)
             
-            # Handle both list and dictionary responses
             if isinstance(result, list):
-                # If result is a list, take the first item
                 result = result[0]
             
-            # Get the dominant emotion and its confidence
             if isinstance(result, dict):
-                dominant_emotion = result.get('dominant_emotion', 'unknown')
                 emotions = result.get('emotion', {})
-                confidence = emotions.get(dominant_emotion, 0.0)
-                return dominant_emotion, confidence
-            else:
-                print(f"Unexpected result format: {type(result)}")
-                return 'unknown', 0.0
+                # Focus only on angry, neutral, and happy
+                angry = emotions.get('angry', 0.0)
+                neutral = emotions.get('neutral', 0.0)
+                happy = emotions.get('happy', 0.0)
+                
+                # Find the highest confidence among the three emotions
+                if angry > neutral and angry > happy:
+                    return 'angry', angry
+                elif happy > neutral and happy > angry:
+                    return 'happy', happy
+                else:
+                    return 'neutral', neutral
+            return 'neutral', 0.0
                 
         except Exception as e:
             print(f"Error in emotion analysis: {str(e)}")
-            return 'unknown', 0.0
+            return 'neutral', 0.0
     
     def draw_results(self, frame, x, y, w, h, worker_id, emotion, confidence):
         """Draw bounding box and information on the frame"""
         # Draw rectangle around face
-        color = (0, 255, 0) if worker_id else (255, 0, 0)  # Green for workers, Red for strangers
+        color = (0, 255, 0)  # Green for all faces
         cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
         
         # Prepare text
-        if worker_id:
-            text = f"Worker {worker_id}: {emotion} ({confidence:.2f})"
-        else:
-            text = "Unknown"
+        text = f"{worker_id}: {emotion} ({confidence:.2f})"
             
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.8
@@ -173,47 +174,74 @@ def main():
     detector = WorkerEmotionDetector()
     
     # RTSP camera URL - exact URL that works with VLC
-    rtsp_url = "rtsp://admin:Abc12345@192.168.150.142:554/Streaming/Channels/102"
+    rtsp_url = "rtsp://admin:Abc12345@192.168.150.116:554/Streaming/Channels/102"
     
+    print("\n=== Worker Emotion Detection System ===")
     print("Initializing RTSP camera...")
     print(f"Connecting to: {rtsp_url}")
     
     # Configure FFMPEG options to match VLC-like behavior
-    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|buffer_size;1024000|max_delay;2000000|stimeout;2000000|recv_buffer_size;1024000'
+    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|buffer_size;1024000|max_delay;2000000|stimeout;2000000|recv_buffer_size;1024000|rtsp_flags;prefer_tcp'
     
     # Initialize video capture with FFMPEG backend
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    cap = None
+    max_connection_attempts = 5
+    connection_delay = 3
     
-    if not cap.isOpened():
-        print("Error: Could not open RTSP stream")
-        print("Please check:")
-        print("1. Network connectivity")
-        print("2. Camera IP address and port")
-        print("3. Username and password")
-        print("4. RTSP stream URL format")
+    for attempt in range(max_connection_attempts):
+        try:
+            print(f"\nConnection attempt {attempt + 1}/{max_connection_attempts}")
+            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            
+            # Set additional capture properties for better stability
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 8)
+                cap.set(cv2.CAP_PROP_FPS, 25)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                
+                # Test the connection
+                test_frames = 0
+                max_test_frames = 5
+                while test_frames < max_test_frames:
+                    ret, _ = cap.read()
+                    if ret:
+                        test_frames += 1
+                    else:
+                        break
+                
+                if test_frames == max_test_frames:
+                    print("✓ Camera connection established and verified")
+                    break
+                else:
+                    print("✗ Camera connection test failed")
+                    cap.release()
+                    cap = None
+            
+            if attempt < max_connection_attempts - 1:
+                print(f"Retrying in {connection_delay} seconds...")
+                time.sleep(connection_delay)
+                
+        except Exception as e:
+            print(f"Error during connection attempt {attempt + 1}: {str(e)}")
+            if cap is not None:
+                cap.release()
+                cap = None
+            if attempt < max_connection_attempts - 1:
+                time.sleep(connection_delay)
+    
+    if not cap or not cap.isOpened():
+        print("\nError: Could not establish stable camera connection")
         return
-    
-    # Don't set resolution/FPS - use native stream settings
-    # Get stream properties
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    print(f"Camera stream properties - Resolution: {width}x{height}, FPS: {fps}")
-    
-    # Set a larger buffer size for smoother streaming
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
     
     # Initialize face cascade classifier
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
-    print("Starting worker emotion detection...")
-    print("Press 'q' to quit, 'a' to add new worker")
-    
-    # For FPS calculation
-    frame_count = 0
-    start_time = time.time()
-    last_fps = 0
+    print("\n=== System Ready ===")
+    print("Commands:")
+    print("- Press 'a' to add a new worker")
+    print("- Press 'q' to quit")
+    print("===================\n")
     
     # Performance optimization parameters
     PROCESSING_INTERVAL = 3  # Process every 3rd frame
@@ -222,162 +250,227 @@ def main():
     
     # For emotion analysis rate limiting
     last_emotion_time = time.time()
-    EMOTION_INTERVAL = 0.5  # Analyze emotions twice per second
+    EMOTION_INTERVAL = 1.0  # Analyze emotions once per second
     
     # Store last detected emotions
     last_emotions = {}
     
     # Add reconnection logic
     max_reconnect_attempts = 5
-    reconnect_delay = 2  # seconds
+    reconnect_delay = 3
     last_frame_time = time.time()
-    frame_timeout = 5  # seconds
+    frame_timeout = 3
     error_count = 0
     max_errors = 10
     
-    while True:
-        try:
-            # Read frame from RTSP stream
-            ret, frame = cap.read()
-            
-            # Check if frame is valid
-            if not ret or frame is None:
-                current_time = time.time()
-                if current_time - last_frame_time > frame_timeout:
-                    print("Error: No frames received for too long")
-                    print("Attempting to reconnect...")
-                    
-                    # Try to reconnect
-                    for attempt in range(max_reconnect_attempts):
-                        print(f"Reconnection attempt {attempt + 1}/{max_reconnect_attempts}")
-                        cap.release()
-                        time.sleep(reconnect_delay)
-                        # Reinitialize with the same settings
-                        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                        cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
-                        if cap.isOpened():
-                            print("Successfully reconnected to RTSP stream")
-                            last_frame_time = time.time()
-                            error_count = 0
-                            break
-                        if attempt == max_reconnect_attempts - 1:
-                            print("Failed to reconnect after multiple attempts. Exiting...")
-                            return
-                    
-                    continue
-                else:
-                    continue
-            
-            last_frame_time = time.time()
-            frame_counter += 1
-            
-            # Create processing frame (smaller version for face detection)
-            processing_frame = cv2.resize(frame, (640, 360))
-            
-            # Detect faces using cascade classifier with optimized parameters
-            gray = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4, minSize=(30, 30))
-            
-            # Scale face coordinates back to original frame size
-            scale_x = frame.shape[1] / processing_frame.shape[1]
-            scale_y = frame.shape[0] / processing_frame.shape[0]
-            
-            # Process each detected face
-            for i, (x, y, w, h) in enumerate(faces):
-                # Scale coordinates back to original frame size
-                x = int(x * scale_x)
-                y = int(y * scale_y)
-                w = int(w * scale_x)
-                h = int(h * scale_y)
+    # Performance optimization: Pre-allocate frame arrays
+    processing_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+    gray_frame = np.zeros((360, 640), dtype=np.uint8)
+    
+    # Create a named window for better key handling
+    cv2.namedWindow('Worker Emotion Detection', cv2.WINDOW_NORMAL)
+    
+    # Flag to track if we're in add worker mode
+    is_adding_worker = False
+    face_detected = False
+    face_roi = None
+    
+    try:
+        while True:
+            try:
+                # Read frame from RTSP stream
+                ret, frame = cap.read()
                 
-                face_roi = frame[y:y+h, x:x+w]
-                
-                # Recognize worker
-                worker_id, recognition_confidence = detector.recognize_worker(face_roi)
-                
-                # Rate limit emotion analysis
-                current_time = time.time()
-                if current_time - last_emotion_time >= EMOTION_INTERVAL:
-                    # Analyze emotion for all faces
-                    emotion, emotion_confidence = detector.analyze_emotion(face_roi)
-                    last_emotions[i] = (emotion, emotion_confidence)
-                    last_emotion_time = current_time
-                    
-                    # Print emotion details to console
-                    if worker_id:
-                        print(f"Worker {worker_id}: {emotion} ({emotion_confidence:.2f})")
+                # Check if frame is valid
+                if not ret or frame is None:
+                    current_time = time.time()
+                    if current_time - last_frame_time > frame_timeout:
+                        print("\nError: No frames received for too long")
+                        print("Attempting to reconnect...")
+                        
+                        # Try to reconnect
+                        for attempt in range(max_reconnect_attempts):
+                            print(f"Reconnection attempt {attempt + 1}/{max_reconnect_attempts}")
+                            cap.release()
+                            time.sleep(reconnect_delay)
+                            
+                            # Reinitialize with the same settings
+                            cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                            if cap.isOpened():
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 8)
+                                cap.set(cv2.CAP_PROP_FPS, 25)
+                                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                                
+                                # Test the reconnection
+                                test_frames = 0
+                                max_test_frames = 3
+                                while test_frames < max_test_frames:
+                                    ret, _ = cap.read()
+                                    if ret:
+                                        test_frames += 1
+                                    else:
+                                        break
+                                
+                                if test_frames == max_test_frames:
+                                    print("✓ Successfully reconnected to RTSP stream")
+                                    last_frame_time = time.time()
+                                    error_count = 0
+                                    break
+                                else:
+                                    print("✗ Reconnection test failed")
+                                    cap.release()
+                                    cap = None
+                            
+                            if attempt == max_reconnect_attempts - 1:
+                                print("Failed to reconnect after multiple attempts. Exiting...")
+                                return
+                        
+                        continue
                     else:
-                        print(f"Unknown person: {emotion} ({emotion_confidence:.2f})")
+                        continue
                 
-                # Draw results using last known emotions
-                if i in last_emotions:
-                    emotion, confidence = last_emotions[i]
-                    detector.draw_results(frame, x, y, w, h, worker_id, emotion, confidence)
-                else:
-                    detector.draw_results(frame, x, y, w, h, worker_id, None, 0)
-            
-            # Calculate and display FPS
-            frame_count += 1
-            if frame_count % 30 == 0:
-                end_time = time.time()
-                last_fps = 30 / (end_time - start_time)
-                start_time = time.time()
-                print(f"FPS: {last_fps:.2f}")
-            
-            # Display FPS on frame
-            cv2.putText(frame, f"FPS: {last_fps:.1f}",
-                        (10, frame.shape[0] - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # Display the frame
-            cv2.imshow('Worker Emotion Detection', frame)
-            
-            # Handle keyboard input
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('a'):
-                # Add new worker
-                if len(faces) > 0:
-                    # Use the first detected face
-                    x, y, w, h = faces[0]
+                last_frame_time = time.time()
+                frame_counter += 1
+                
+                # Skip frames for better performance
+                if frame_counter % PROCESSING_INTERVAL != 0:
+                    continue
+                
+                # Create processing frame (smaller version for face detection)
+                cv2.resize(frame, (640, 360), dst=processing_frame)
+                
+                # Detect faces using cascade classifier with optimized parameters
+                cv2.cvtColor(processing_frame, cv2.COLOR_BGR2GRAY, dst=gray_frame)
+                faces = face_cascade.detectMultiScale(
+                    gray_frame,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=(100, 100),
+                    maxSize=(300, 300),
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+                
+                # Scale face coordinates back to original frame size
+                scale_x = frame.shape[1] / processing_frame.shape[1]
+                scale_y = frame.shape[0] / processing_frame.shape[0]
+                
+                # Process each detected face
+                for i, (x, y, w, h) in enumerate(faces):
                     # Scale coordinates back to original frame size
                     x = int(x * scale_x)
                     y = int(y * scale_y)
                     w = int(w * scale_x)
                     h = int(h * scale_y)
-                    face_roi = frame[y:y+h, x:x+w]
                     
-                    # Ensure the face region is valid
-                    if face_roi.size > 0 and face_roi.shape[0] > 0 and face_roi.shape[1] > 0:
-                        worker_id = input("Enter worker ID: ")
-                        if worker_id.strip():  # Check if worker_id is not empty
-                            print("Adding worker... Please wait while the model initializes...")
-                            if detector.add_worker(worker_id, face_roi):
-                                print("Worker added successfully!")
-                            else:
-                                print("Failed to add worker. Please try again.")
-                        else:
-                            print("Error: Worker ID cannot be empty")
+                    # Additional validation for face detection
+                    face_roi = frame[y:y+h, x:x+w]
+                    if face_roi.size == 0 or face_roi.shape[0] < 100 or face_roi.shape[1] < 100:
+                        continue  # Skip invalid face regions
+                    
+                    # If in add worker mode, store the face ROI
+                    if is_adding_worker:
+                        face_detected = True
+                        # Draw green rectangle around the face
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                        cv2.putText(frame, "Press 's' to capture", (x, y-10),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        break
+                    
+                    # Check if this is a known worker
+                    worker_id, worker_confidence = detector.recognize_worker(face_roi)
+                    if worker_id is None:
+                        continue  # Skip unknown faces
+                    
+                    # Rate limit emotion analysis
+                    current_time = time.time()
+                    if current_time - last_emotion_time >= EMOTION_INTERVAL:
+                        # Analyze emotion for known workers only
+                        emotion, emotion_confidence = detector.analyze_emotion(face_roi)
+                        last_emotions[i] = (emotion, emotion_confidence)
+                        last_emotion_time = current_time
+                        
+                        # Print worker and emotion details to console
+                        print(f"Worker {worker_id}: {emotion} ({emotion_confidence:.2f})")
+                    
+                    # Draw results using last known emotions
+                    if i in last_emotions:
+                        emotion, confidence = last_emotions[i]
+                        detector.draw_results(frame, x, y, w, h, worker_id, emotion, confidence)
                     else:
-                        print("Error: Invalid face region detected")
-                else:
-                    print("No face detected. Please position a face in the camera view.")
-        
-        except Exception as e:
-            error_count += 1
-            print(f"Error processing frame: {str(e)}")
-            if error_count >= max_errors:
-                print("Too many errors encountered. Attempting to reconnect...")
-                cap.release()
-                time.sleep(reconnect_delay)
-                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                error_count = 0
-            continue
+                        detector.draw_results(frame, x, y, w, h, worker_id, 'neutral', 0)
+                
+                # Display the frame
+                cv2.imshow('Worker Emotion Detection', frame)
+                
+                # Handle keyboard input
+                key = cv2.waitKey(1) & 0xFF
+                
+                if key == ord('q'):
+                    print("\nQuitting program...")
+                    break
+                elif key == ord('a') and not is_adding_worker:
+                    is_adding_worker = True
+                    face_detected = False
+                    print("\n=== Adding New Worker ===")
+                    print("Please position the worker's face in the camera view...")
+                    print("Press 's' to capture the face, or 'q' to cancel")
+                elif key == ord('s') and is_adding_worker and face_detected:
+                    # Show preview of the face to be captured
+                    preview = face_roi.copy()
+                    cv2.putText(preview, "Press 'y' to confirm, 'n' to retry", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.imshow('Face Preview', preview)
+                    
+                    # Wait for confirmation
+                    confirm_key = cv2.waitKey(0) & 0xFF
+                    cv2.destroyWindow('Face Preview')
+                    
+                    if confirm_key == ord('y'):
+                        # Ask for worker ID
+                        print("\nEnter worker ID and press Enter (or press Enter to cancel):")
+                        worker_id = input("Worker ID: ").strip()
+                        
+                        if worker_id:
+                            print(f"\nAdding worker {worker_id}...")
+                            # Add the worker
+                            if detector.add_worker(worker_id, face_roi):
+                                print(f"✓ Worker {worker_id} added successfully!")
+                                print("The worker will be recognized in future sessions.")
+                            else:
+                                print("✗ Failed to add worker. Please try again.")
+                        else:
+                            print("✗ Worker ID cannot be empty. Operation cancelled.")
+                    elif confirm_key == ord('n'):
+                        print("Retrying face capture...")
+                        continue
+                    else:
+                        print("✗ Operation cancelled.")
+                    
+                    is_adding_worker = False
+                    face_detected = False
+                    print("=== Press 'a' again to add another worker ===\n")
+                
+            except Exception as e:
+                error_count += 1
+                print(f"\nError processing frame: {str(e)}")
+                if error_count >= max_errors:
+                    print("Too many errors encountered. Attempting to reconnect...")
+                    cap.release()
+                    time.sleep(reconnect_delay)
+                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                    error_count = 0
+                continue
     
-    # Clean up
-    cap.release()
-    cv2.destroyAllWindows()
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user.")
+    finally:
+        # Cleanup
+        print("\nCleaning up resources...")
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        print("Program terminated successfully.")
 
 if __name__ == "__main__":
     main() 

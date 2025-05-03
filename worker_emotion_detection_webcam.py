@@ -4,6 +4,11 @@ from deepface import DeepFace
 import os
 import time
 from datetime import datetime
+import sqlite3
+
+# Define emotion labels - only the ones we care about
+emotion_labels = ['angry', 'happy', 'neutral']
+
 
 class WorkerEmotionDetector:
     def __init__(self, db_path='worker_db'):
@@ -168,109 +173,196 @@ class WorkerEmotionDetector:
                     (x + margin, y - margin),
                     font, font_scale, color, thickness)
 
+def initialize_database():
+    """Initialize the SQLite database for storing emotion data"""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'worker_emotions.db')
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Drop existing table if it exists
+    cursor.execute('DROP TABLE IF EXISTS worker_emotions')
+    
+    # Create new table with correct structure
+    cursor.execute('''
+    CREATE TABLE worker_emotions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        worker_id TEXT NOT NULL,
+        emotion_type TEXT NOT NULL,
+        emotion_percentage REAL NOT NULL,
+        recorded_datetime TEXT NOT NULL
+    )
+    ''')
+    
+    conn.commit()
+    return conn
+
+def store_emotion_data(conn, worker_id, emotion_type, emotion_percentage):
+    """Store emotion data in the database"""
+    cursor = conn.cursor()
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    cursor.execute('''
+    INSERT INTO worker_emotions (worker_id, emotion_type, emotion_percentage, recorded_datetime)
+    VALUES (?, ?, ?, ?)
+    ''', (worker_id, emotion_type, emotion_percentage, current_time))
+    
+    conn.commit()
+
+def recognize_worker(face_img, known_workers):
+    """Try to recognize if the face belongs to a known worker"""
+    try:
+        for worker_id in known_workers:
+            worker_dir = os.path.join('worker_db', worker_id)
+            for reference_img in os.listdir(worker_dir):
+                if reference_img.endswith(('.jpg', '.jpeg', '.png')):
+                    reference_path = os.path.join(worker_dir, reference_img)
+                    try:
+                        result = DeepFace.verify(face_img, reference_path, 
+                                               model_name='VGG-Face',
+                                               detector_backend='opencv',
+                                               enforce_detection=False,
+                                               silent=True)
+                        
+                        if result['verified']:
+                            return worker_id, result['distance']
+                    except Exception as e:
+                        continue
+        return None, None
+    except Exception as e:
+        print(f"Error in worker recognition: {str(e)}")
+        return None, None
+
+def register_worker(frame, face_detector):
+    # Convert frame to grayscale for face detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Detect faces
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    
+    if len(faces) == 0:
+        print("No face detected. Please position the worker in front of the camera.")
+        return None
+    
+    # Get the first detected face
+    x, y, w, h = faces[0]
+    face_roi = frame[y:y+h, x:x+w]
+    
+    # Get worker ID from user
+    worker_id = input("Enter worker ID: ").strip()
+    if not worker_id:
+        print("Invalid worker ID")
+        return None
+    
+    try:
+        # Save worker's face image to worker_db folder
+        worker_dir = os.path.join('worker_db', worker_id)
+        if not os.path.exists(worker_dir):
+            os.makedirs(worker_dir)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        face_path = os.path.join(worker_dir, f"face_{timestamp}.jpg")
+        cv2.imwrite(face_path, face_roi)
+        
+        print(f"Worker {worker_id} registered successfully!")
+        print(f"Face image saved to: {face_path}")
+        return worker_id
+        
+    except Exception as e:
+        print(f"Error registering worker: {str(e)}")
+        return None
+
+def process_frame(frame, face_detector, known_workers, db_conn):
+    # Convert frame to grayscale for face detection
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # Detect faces
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    
+    # Process each detected face
+    for (x, y, w, h) in faces:
+        # Extract face ROI
+        face_roi = frame[y:y+h, x:x+w]
+        
+        # Try to recognize the worker
+        worker_id, confidence = recognize_worker(face_roi, known_workers)
+        
+        if worker_id is not None:
+            try:
+                # Analyze emotion using DeepFace
+                result = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False)
+                
+                # Get only the emotions we care about
+                emotions = result[0]['emotion']
+                relevant_emotions = {emotion: emotions[emotion] for emotion in ['angry', 'happy', 'neutral']}
+                
+                # Calculate total of relevant emotions
+                total = sum(relevant_emotions.values())
+                
+                # Get the emotion with highest probability and calculate its percentage
+                emotion_name = max(relevant_emotions, key=relevant_emotions.get)
+                emotion_percentage = (relevant_emotions[emotion_name] / total) * 100 if total > 0 else 0
+                
+                # Store emotion data in database
+                store_emotion_data(db_conn, worker_id, emotion_name, emotion_percentage)
+                
+                # Draw rectangle around face
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                
+                # Display worker ID and emotion
+                text = f"{worker_id}: {emotion_name} ({emotion_percentage:.1f}%)"
+                cv2.putText(frame, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    
+            except Exception as e:
+                print(f"Error processing face: {str(e)}")
+                continue
+        else:
+            # Draw rectangle around unknown face
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+            cv2.putText(frame, "Unknown", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+    
+    return frame
+
 def main():
-    # Initialize detector
-    detector = WorkerEmotionDetector()
+    # Initialize face detector
+    face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     
-    print("Initializing webcam...")
-    
-    # Initialize video capture with webcam
-    cap = cv2.VideoCapture(0)  # 0 for default webcam
-    
-    if not cap.isOpened():
-        print("Error: Could not open webcam")
-        print("Please check:")
-        print("1. Webcam is connected")
-        print("2. Webcam is not being used by another application")
-        return
-    
-    # Set webcam properties
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Set width
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Set height
-    cap.set(cv2.CAP_PROP_FPS, 30)  # Set FPS
-    
-    # Get webcam properties
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    print(f"Webcam properties - Resolution: {width}x{height}, FPS: {fps}")
-    
-    # Initialize face cascade classifier
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-    
-    print("Starting worker emotion detection...")
-    print("Press 'q' to quit, 'a' to add new worker")
-    
-    # For FPS calculation
-    frame_count = 0
-    start_time = time.time()
-    last_fps = 0
-    
-    # Performance optimization parameters
-    PROCESSING_INTERVAL = 3  # Process every 3rd frame
-    SKIP_FRAMES = 1  # Process every frame
-    frame_counter = 0
-    
-    # For emotion analysis rate limiting
-    last_emotion_time = time.time()
-    EMOTION_INTERVAL = 0.5  # Analyze emotions twice per second
-    
-    # Store last detected emotions
-    last_emotions = {}
-    
-    while True:
-        try:
-            # Read frame from webcam
+    # Initialize database
+    db_conn = None
+    cap = None
+    try:
+        db_conn = initialize_database()
+        
+        # Load existing workers from worker_db folder
+        known_workers = []
+        for worker_id in os.listdir('worker_db'):
+            worker_dir = os.path.join('worker_db', worker_id)
+            if os.path.isdir(worker_dir):
+                known_workers.append(worker_id)
+                print(f"Found existing worker: {worker_id}")
+        
+        # Open webcam
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Error: Could not open webcam")
+            return
+        
+        # Set webcam properties for better performance
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        print("\nPress 'a' to add new worker")
+        print("Press 'q' to quit")
+        
+        while True:
             ret, frame = cap.read()
-            
             if not ret:
                 print("Error: Could not read frame from webcam")
                 break
-            
-            # Increment frame counter
-            frame_counter += 1
-            
-            # Calculate FPS
-            frame_count += 1
-            current_time = time.time()
-            if current_time - start_time >= 1.0:
-                last_fps = frame_count
-                frame_count = 0
-                start_time = current_time
-            
-            # Process every PROCESSING_INTERVAL frames
-            if frame_counter % PROCESSING_INTERVAL == 0:
-                # Convert to grayscale for face detection
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 
-                # Detect faces
-                faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-                
-                # Process each detected face
-                for (x, y, w, h) in faces:
-                    # Extract face region
-                    face_img = frame[y:y+h, x:x+w]
-                    
-                    # Recognize worker
-                    worker_id, confidence = detector.recognize_worker(face_img)
-                    
-                    # Analyze emotion if enough time has passed
-                    current_time = time.time()
-                    if current_time - last_emotion_time >= EMOTION_INTERVAL:
-                        emotion, emotion_confidence = detector.analyze_emotion(face_img)
-                        last_emotions[(x, y)] = (emotion, emotion_confidence)
-                        last_emotion_time = current_time
-                    
-                    # Get last detected emotion for this face
-                    emotion, emotion_confidence = last_emotions.get((x, y), ('unknown', 0.0))
-                    
-                    # Draw results on frame
-                    detector.draw_results(frame, x, y, w, h, worker_id, emotion, emotion_confidence)
-            
-            # Display FPS
-            cv2.putText(frame, f"FPS: {last_fps}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            # Process frame
+            frame = process_frame(frame, face_detector, known_workers, db_conn)
             
             # Display frame
             cv2.imshow('Worker Emotion Detection', frame)
@@ -278,26 +370,37 @@ def main():
             # Handle key presses
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
+                print("\nQuitting program...")
                 break
             elif key == ord('a'):
-                # Add new worker
-                worker_id = input("Enter worker ID: ")
-                if worker_id:
-                    # Get the first detected face
-                    if len(faces) > 0:
-                        x, y, w, h = faces[0]
-                        face_img = frame[y:y+h, x:x+w]
-                        detector.add_worker(worker_id, face_img)
-                    else:
-                        print("No face detected. Please position the worker in front of the camera.")
-        
-        except Exception as e:
-            print(f"Error in main loop: {str(e)}")
-            continue
+                new_worker = register_worker(frame, face_detector)
+                if new_worker:
+                    known_workers.append(new_worker)
     
-    # Release resources
-    cap.release()
-    cv2.destroyAllWindows()
+    except Exception as e:
+        print(f"Error in main loop: {str(e)}")
+    
+    finally:
+        # Cleanup
+        print("\nCleaning up resources...")
+        if db_conn is not None:
+            try:
+                db_conn.close()
+            except Exception as e:
+                print(f"Error closing database: {str(e)}")
+        
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception as e:
+                print(f"Error releasing webcam: {str(e)}")
+        
+        try:
+            cv2.destroyAllWindows()
+        except Exception as e:
+            print(f"Error closing windows: {str(e)}")
+        
+        print("Program terminated successfully.")
 
 if __name__ == "__main__":
     main() 
