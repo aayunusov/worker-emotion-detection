@@ -2,6 +2,45 @@
 
 A real-time emotion detection system that can recognize workers and analyze their emotions using either an RTSP camera or a webcam. The system uses face detection and recognition to identify known workers and analyzes their emotional state in real-time.
 
+## Dataset collection bot
+
+A private Telegram bot asks a consenting adult to pose seven expressions and send two new photos of each. The prompt is the label. Photos are saved only on the computer that runs the bot:
+
+```text
+dataset/P0001/meta.json
+dataset/P0001/neutral_01.jpg
+dataset/P0001/neutral_02.jpg
+dataset/P0001/happy_01.jpg
+...
+dataset/registry.json
+dataset/bot.log
+```
+
+`dataset/` is gitignored. The bot does not upload it. Set `DATASET_DIR` in `.env` if the files should go to another disk. Saved JPEGs are re-encoded, so phone location data is not kept. Names are not asked.
+
+### Launch
+
+1. In Telegram, open `@BotFather`, send `/newbot`, and copy the token.
+2. Copy `.env.example` to `.env` and paste the token as `TELEGRAM_BOT_TOKEN`.
+3. Install and start the bot on the computer that should keep the photos:
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements-bot.txt
+python -m collection_bot
+```
+
+The terminal prints the folder it is writing to. Leave that process running. On Windows, activate the venv with `venv\Scripts\activate`.
+
+4. On your phone, open the bot, send `/start`, and finish one session yourself (14 photos). Then check that `dataset/P0001/` contains the JPEGs and `meta.json`.
+5. Share the bot link. Each person works in a private chat. Commands: `/start`, `/delete`, `/cancel`.
+6. While it is running, `python -m collection_bot.status` prints the counts. After collection, `python -m collection_bot.export` writes `dataset/manifest.csv`. That file contains Telegram ids. Keep the whole `dataset/` folder private, and copy it to a backup disk at the end of the day.
+
+Restarting the program does not lose photos. The next photo or button continues that person's session, and `/start` resumes it too. `/delete` removes their folder.
+
+Install `requirements-bot.txt` for this bot. `requirements.txt` is the older camera system and pulls in TensorFlow and dlib, which this bot does not use.
+
 ## Features
 
 - Real-time face detection and recognition

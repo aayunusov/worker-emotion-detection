@@ -49,6 +49,8 @@ ENV/
 # Project specific
 worker_db/
 datasets/
+# Consented face photos collected by the Telegram bot. Never commit this.
+dataset/
 *.dat
 *.dat.bz2
 *.caffemodel
